@@ -1,9 +1,131 @@
-import json
 import os
-from readFITS import read_lambda, wl_shift, fit_cont
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import pearsonr
+import scipy.interpolate as scin
+
+cls = 299792.458
+
+
+def read_lambda(fits, apertures):
+
+    header = fits[1].header
+    spec = fits[1].data[:]
+    ciag = ""
+    WATstring = []
+
+    for card in fits[0].header.cards['WAT2_*']:
+        if len(card[1]) == 67:
+            ciag += ("%s " % card[1])
+        else:
+            ciag += card[1]
+
+    for elem in ciag.split("="):
+        for item in elem.split("spec"):
+            if (len(item) > 6.0):
+                WATstring.append(item.strip().strip("\""))
+
+    spectrum = {}
+    if WATstring:
+        WATtab = np.array([item.split() for item in WATstring], dtype=float)
+
+        # Pixels to wavelength transformation
+        for ap in apertures:
+            ap_flux = spec[ap - 1]
+            # Apply Chebyshev polynomial transformation
+            if (WATtab[ap, 2] == 2):
+                x = np.linspace(-1, 1, len(ap_flux))
+                coef = WATtab[ap - 1, 15:]
+                lam = np.polynomial.chebyshev.chebval(x, coef)
+            # Apply linear fit
+            elif WATtab[ap - 1, 2] == 0:
+                first = WATtab[ap - 1, 3]
+                step = WATtab[ap - 1, 4]
+                lam = first + np.arange(len(ap_flux)) * step
+            spectrum[ap] = {'lam': lam, 'flux': ap_flux}
+
+    else:
+        x = np.arange(spec.shape[0])+1.
+        crval = fits[1].header['CRVAL1']
+        cdelt = fits[1].header['CDELT1']
+        try:
+            ref = float(fits[1].header['CRPIX1'])
+        except KeyError:
+            ref = 1.
+
+        try:
+            cd11 = fits[1].header['CD1_1']
+        except KeyError:
+            cd11 = cdelt
+
+        lam = crval + cd11 * (x - ref)
+        spectrum[1] = {'lam': lam, 'flux': spec}
+
+    return header, spectrum
+
+
+def cont_snr_in(knots, to_fit):
+    ksigma = []
+    xc = []
+    kn_nr = len(knots)
+    for j, knot in enumerate(knots):
+        if j == 0:
+            bk = to_fit[np.where(to_fit[:, 0] < knot)]
+        elif j == kn_nr-1:
+            bk = to_fit[np.where(to_fit[:, 0] > knot)]
+        else:
+            bk = to_fit[np.where((to_fit[:, 0] > knot) &
+                                 (to_fit[:, 0] < knots[j + 1]))]
+
+        ksigma.append(1./(1.-np.std(bk[:, 1])))
+        xc.append(np.average(bk[:, 0]))
+    return xc, ksigma
+
+
+def fit_cont(lam_flux, kn_nr, low, high):
+    clean = False
+    to_fit = np.zeros((len(lam_flux['lam']), 2))
+
+    to_fit[:, 0] = lam_flux['lam']
+    to_fit[:, 1] = lam_flux['flux']
+
+    chitab = []
+    while not clean:
+        x, y = to_fit[:, 0], to_fit[:, 1]
+        odst = (x.max() - x.min())/(kn_nr+1.)
+        knots = x[0]+odst*(np.arange(1, kn_nr+1.))
+
+        if knots[-1] > x[-1]:
+            knots[-1] = x[-1]-0.1
+
+        xc, ksigma = cont_snr_in(knots, to_fit)
+        s = scin.LSQUnivariateSpline(x, y, knots, k=3)
+        ys = s(x)
+        sigma = np.std(y/s(x))
+        chi2 = np.average((y-ys)**2/ys)
+        chitab.append(chi2)
+
+        low_level = y/ys-low*sigma
+        # build low level threshold
+        for j, knot in enumerate(knots):
+            if j == 0:
+                ind = np.where(x[:] < knot)
+            else:
+                ind = np.where((x[:] < knot) & (x[:] > knots[j-1]))
+            low_level[ind] = low_level[ind]*ksigma[j]
+
+        high_level = ys + ys*high*sigma
+        ind = np.where((y > low*s(x)) & (y < high_level))
+        to_fit = np.transpose(np.array((x[ind], y[ind])))
+
+        if (
+            (len(chitab) > 1 and chitab[-2]-chitab[-1] < 0.0001)
+            or to_fit.shape[0] < kn_nr
+        ):
+            clean = True
+
+    cont = lam_flux['flux']/s(lam_flux['lam'])
+    return cont
+
 
 def correlated_samples_with_errors(x, y, x_err, y_err, n_simulations=1000):
     """
@@ -28,16 +150,6 @@ def correlated_samples_with_errors(x, y, x_err, y_err, n_simulations=1000):
         corr, _ = pearsonr(x_sim, y_sim)
         correlations.append(corr)
     return correlations
-
-def get_ptps_data(star):
-    with open('PTPS_DB.json') as f:
-        ptps = json.load(f)
-
-    for record in ptps:
-        if record.get('PTPS') == star or record.get('TYC') == star:
-            return record  # Return immediately when found
-
-    return None
 
 
 def get_spectra(spec, data_dir, tel, epochs=None, zeroshift=True,
@@ -113,20 +225,3 @@ def get_spectra(spec, data_dir, tel, epochs=None, zeroshift=True,
 
     return spec_collection
 
-
-sp = get_ptps_data('PTPS_1433')
-s = get_spectra(sp, './spectra', 'TNG', hetpart='red', aper=[1], cont=True )
-print(s)
-exit()
-
-for i, epoch in enumerate(s):
-    for ap in s[epoch]:
-        plt.plot(s[epoch][ap]['lam0'], s[epoch][ap]['cont']+(i*0.1), label=epoch)
-#plt.legend()
-#plt.axvline(5889.95)
-#plt.axvline(5895.92)
-#plt.axvline(6562.81)
-#plt.axvline(6717.69)
-#plt.xlim(6717.00,6718)
-#plt.xlim(3900,4000)
-plt.show()
