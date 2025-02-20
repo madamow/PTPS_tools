@@ -5,6 +5,9 @@ import scipy.interpolate as scin
 
 cls = 299792.458
 
+def wl_shift(lam, vel):
+    lam_shifted = lam * np.sqrt((1.0+(vel/cls))/(1.0-(vel/cls)))
+    return lam_shifted
 
 def read_lambda(fits, apertures):
 
